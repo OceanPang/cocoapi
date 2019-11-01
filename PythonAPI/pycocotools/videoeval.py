@@ -552,7 +552,7 @@ class VideoEval:
         '''
         def _summarize( ap=1, iouThr=None, catId=None, areaRng='all', tempRng='all', maxDets=1000 ):
             p = self.params
-            iStr = ' {:<18} {} @[ IoU={:<9} | catId={:>3s} | area={:>6s} | length={:>6s} | maxDets={:>3d} ] = {:0.3f}'
+            iStr = ' {:<19} {} @[ IoU={:<9} | catId={:>3s} | area={:>6s} | length={:>6s} | maxDets={:>3d} ] = {:0.3f}'
             titleStr = 'Average Precision' if ap == 1 else 'Average Recall'
             typeStr = '(AP)' if ap==1 else '(AR)'
             iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
