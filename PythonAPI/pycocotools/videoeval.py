@@ -7,6 +7,14 @@ from collections import defaultdict
 from . import mask as maskUtils
 import copy
 
+def iou(d, g):
+    x1, y1 = max(d[0], g[0]), max(d[1], g[1])
+    x2 = min(d[2] + d[0] - 1, g[2] + g[0] - 1)
+    y2 = min(d[3] + d[1] - 1, g[3] + g[1] - 1)
+    i = max(0, x2 - x1 + 1) * max(0, y2 - y1 + 1)
+    u = g[2] * g[3] + d[2] * d[3] - i
+    return i / float(u)
+
 class VideoEval:
     # Interface for evaluating video tracking / instance segmentation.
     #
@@ -164,10 +172,11 @@ class VideoEval:
         evaluateVid = self.evaluateVid
         maxDet = p.maxDets[-1]
         print('Matching...')
-        self.evalVids = [evaluateVid(vidId, catId, areaRng, tempRng, maxDet)
+        self.evalVids = [evaluateVid(vidId, catId, areaRng, tempRng, speedRng, maxDet)
                  for catId in catIds
                  for areaRng in p.areaRng
                  for tempRng in p.tempRng
+                 for speedRng in p.speedRng
                  for vidId in p.vidIds
              ]
         self._paramsEval = copy.deepcopy(self.params)
@@ -226,12 +235,12 @@ class VideoEval:
                         'video_id': vid_id,
                         'track': [None] * len(img_ids),
                         'avgArea': 0,
-                        'length': 0
+                        'length': 0,
+                        'meanConsecutiveIoU': []
         } for i in ids}
 
         score_counters = defaultdict(int)
         remap_instance_id = defaultdict(int)
-        crowd_count = 0
         for ann in anns:
             img_ind = img_ids.index(ann['image_id'])
             ins_id = ann['instance_id']
@@ -249,7 +258,8 @@ class VideoEval:
                                     'video_id': vid_id,
                                     'track': [None] * len(img_ids),
                                     'avgArea': 0,
-                                    'length': 0
+                                    'length': 0,
+                                    'meanConsecutiveIoU': []
                     }
                     ins_id = max_id
 
@@ -262,15 +272,19 @@ class VideoEval:
             ann_by_track['track'][img_ind] = ann['bbox']
             ann_by_track['avgArea'] += ann['area']
             ann_by_track['length'] += 1
+            # consecutive IoU
+            if img_ind > 0 and ann_by_track['track'][img_ind - 1] is not None:
+                cons_iou = iou(ann_by_track['track'][img_ind - 1], ann['bbox'])
+                ann_by_track['meanConsecutiveIoU'].append(cons_iou)
             # score
             if 'score' in ann.keys():
                 if 'score' not in ann_by_track.keys():
                     ann_by_track['score'] = 0
                 ann_by_track['score'] += ann['score']
                 score_counters[ins_id] += 1
-
         for i in tracks.keys():
             tracks[i]['avgArea'] /= tracks[i]['length']
+            tracks[i]['meanConsecutiveIoU'] = np.mean(tracks[i]['meanConsecutiveIoU']) if len(tracks[i]['meanConsecutiveIoU']) > 0 else -1
 
         # the score of the track is the average of that of each label
         if len(score_counters) > 0:
@@ -345,7 +359,7 @@ class VideoEval:
                 ious[i, j] = np.sum(np.exp(-e)) / e.shape[0]
         return ious
 
-    def evaluateVid(self, vidId, catId, aRng, tempRng, maxDet):
+    def evaluateVid(self, vidId, catId, aRng, tempRng, speedRng, maxDet):
         '''
         perform evaluation for single category and video
         :return: dict (single video results)
@@ -362,7 +376,8 @@ class VideoEval:
 
         for g in gt:
             if g['ignore'] or (g['avgArea']<aRng[0] or g['avgArea']>aRng[1]) or \
-                              (g['length']<tempRng[0] or g['length']>tempRng[1]):
+                              (g['length']<tempRng[0] or g['length']>tempRng[1]) or \
+                              (g['meanConsecutiveIoU']<speedRng[0] or g['meanConsecutiveIoU']>speedRng[1]):
                 g['_ignore'] = 1
             else:
                 g['_ignore'] = 0
@@ -416,14 +431,16 @@ class VideoEval:
                     gtm[tind,m]     = d['id']
                     counter += 1
         # set unmatched detections outside of area and temporal range to ignore
-        a = np.array([d['avgArea']<aRng[0] or d['avgArea']>aRng[1] or d['length']<tempRng[0] or d['length']>tempRng[1] for d in dt]).reshape((1, len(dt)))
+        a = np.array([d['avgArea']<aRng[0] or d['avgArea']>aRng[1] or d['length']<tempRng[0] or d['length']>tempRng[1] for d in dt]).reshape((1, len(dt)) \
+                   or d['meanConsecutiveIoU']<speedRng[0] or d['meanConsecutiveIoU']>speedRng[1])
         dtIg = np.logical_or(dtIg, np.logical_and(dtm==0, np.repeat(a,T,0)))
         # store results for given video and category
         return {
                 'video_id':     vidId,
                 'category_id':  catId,
                 'aRng':         aRng,
-                'tempRng':         tempRng,
+                'tempRng':      tempRng,
+                'speedRng':     speedRng,
                 'maxDet':       maxDet,
                 'dtIds':        [d['id'] for d in dt],
                 'gtIds':        [g['id'] for g in gt],
@@ -453,10 +470,11 @@ class VideoEval:
         K           = len(p.catIds) if p.useCats else 1
         A           = len(p.areaRng)
         TEMP        = len(p.tempRng)
+        SPEED       = len(p.speedRng)
         M           = len(p.maxDets)
-        precision   = -np.ones((T,R,K,A,TEMP,M)) # -1 for the precision of absent categories
-        recall      = -np.ones((T,K,A,TEMP,M))
-        scores      = -np.ones((T,R,K,A,TEMP,M))
+        precision   = -np.ones((T,R,K,A,TEMP,SPEED,M)) # -1 for the precision of absent categories
+        recall      = -np.ones((T,K,A,TEMP,SPEED,M))
+        scores      = -np.ones((T,R,K,A,TEMP,SPEED,M))
 
         # create dictionary for future indexing
         _pe = self._paramsEval
@@ -464,6 +482,7 @@ class VideoEval:
         setK = set(catIds)
         setA = set(map(tuple, _pe.areaRng))
         setTEMP = set(map(tuple, _pe.tempRng))
+        setSPEED = set(map(tuple, _pe.speedRng))
         setM = set(_pe.maxDets)
         setI = set(_pe.vidIds)
         # get inds to evaluate
@@ -471,72 +490,76 @@ class VideoEval:
         m_list = [m for n, m in enumerate(p.maxDets) if m in setM]
         a_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.areaRng)) if a in setA]
         temp_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.tempRng)) if a in setTEMP]
+        speed_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.speedRng)) if a in setSPEED]
         i_list = [n for n, i in enumerate(p.vidIds)  if i in setI]
         I0 = len(_pe.vidIds)
         A0 = len(_pe.areaRng)
         TEMP0 = len(_pe.tempRng)
+        SPEED0 = len(_pe.speedRng)
         # retrieve E at each category, area range, temporal range, and max number of detections
         for k, k0 in enumerate(k_list):
-            Nk = k0*A0*TEMP0*I0
+            Nk = k0*A0*TEMP0*SPEED0*I0
             for a, a0 in enumerate(a_list):
-                Na = a0*TEMP0*I0
+                Na = a0*TEMP0*SPEED0*I0
                 for temp, temp0 in enumerate(temp_list):
-                    Ntemp = temp0*I0
-                    for m, maxDet in enumerate(m_list):
-                        E = [self.evalVids[Nk + Na + Ntemp + i] for i in i_list]
-                        E = [e for e in E if not e is None]
-                        if len(E) == 0:
-                            continue
-                        dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
-                        # different sorting method generates slightly different results.
-                        # mergesort is used to be consistent as Matlab implementation.
-                        inds = np.argsort(-dtScores, kind='mergesort')
-                        dtScoresSorted = dtScores[inds]
+                    Ntemp = temp0*SPEED0*I0
+                    for speed, speed0 in enumerate(speed_list):
+                        Nspeed = speed0 * I0
+                        for m, maxDet in enumerate(m_list):
+                            E = [self.evalVids[Nk + Na + Ntemp + Nspeed + i] for i in i_list]
+                            E = [e for e in E if not e is None]
+                            if len(E) == 0:
+                                continue
+                            dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
+                            # different sorting method generates slightly different results.
+                            # mergesort is used to be consistent as Matlab implementation.
+                            inds = np.argsort(-dtScores, kind='mergesort')
+                            dtScoresSorted = dtScores[inds]
 
-                        dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
-                        dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
-                        gtIg = np.concatenate([e['gtIgnore'] for e in E])
-                        npig = np.count_nonzero(gtIg==0 )
-                        if npig == 0:
-                            continue
-                        tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
-                        fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
-                        tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
-                        fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
-                        for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
-                            tp = np.array(tp)
-                            fp = np.array(fp)
-                            nd = len(tp)
-                            rc = tp / npig
-                            pr = tp / (fp+tp+np.spacing(1))
-                            q  = np.zeros((R,))
-                            ss = np.zeros((R,))
+                            dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
+                            dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
+                            gtIg = np.concatenate([e['gtIgnore'] for e in E])
+                            npig = np.count_nonzero(gtIg==0 )
+                            if npig == 0:
+                                continue
+                            tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
+                            fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
+                            tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
+                            fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+                            for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
+                                tp = np.array(tp)
+                                fp = np.array(fp)
+                                nd = len(tp)
+                                rc = tp / npig
+                                pr = tp / (fp+tp+np.spacing(1))
+                                q  = np.zeros((R,))
+                                ss = np.zeros((R,))
 
-                            if nd:
-                                recall[t,k,a,temp,m] = rc[-1]
-                            else:
-                                recall[t,k,a,temp,m] = 0
+                                if nd:
+                                    recall[t,k,a,temp,speed,m] = rc[-1]
+                                else:
+                                    recall[t,k,a,temp,speed,m] = 0
 
-                            # numpy is slow without cython optimization for accessing elements
-                            # use python array gets significant speed improvement
-                            pr = pr.tolist(); q = q.tolist()
+                                # numpy is slow without cython optimization for accessing elements
+                                # use python array gets significant speed improvement
+                                pr = pr.tolist(); q = q.tolist()
 
-                            for i in range(nd-1, 0, -1):
-                                if pr[i] > pr[i-1]:
-                                    pr[i-1] = pr[i]
+                                for i in range(nd-1, 0, -1):
+                                    if pr[i] > pr[i-1]:
+                                        pr[i-1] = pr[i]
 
-                            inds = np.searchsorted(rc, p.recThrs, side='left')
-                            try:
-                                for ri, pi in enumerate(inds):
-                                    q[ri] = pr[pi]
-                                    ss[ri] = dtScoresSorted[pi]
-                            except:
-                                pass
-                            precision[t,:,k,a,temp,m] = np.array(q)
-                            scores[t,:,k,a,temp,m] = np.array(ss)
+                                inds = np.searchsorted(rc, p.recThrs, side='left')
+                                try:
+                                    for ri, pi in enumerate(inds):
+                                        q[ri] = pr[pi]
+                                        ss[ri] = dtScoresSorted[pi]
+                                except:
+                                    pass
+                                precision[t,:,k,a,temp,speed,m] = np.array(q)
+                                scores[t,:,k,a,temp,speed,m] = np.array(ss)
         self.eval = {
             'params': p,
-            'counts': [T, R, K, A, TEMP, M],
+            'counts': [T, R, K, A, TEMP, SPEED, M],
             'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'precision': precision,
             'recall':   recall,
@@ -550,9 +573,9 @@ class VideoEval:
         Compute and display summary metrics for evaluation results.
         Note this functin can *only* be applied on the default parameter setting
         '''
-        def _summarize( ap=1, iouThr=None, catId=None, areaRng='all', tempRng='all', maxDets=1000 ):
+        def _summarize( ap=1, iouThr=None, catId=None, areaRng='all', tempRng='all', speedRng='all', maxDets=1000 ):
             p = self.params
-            iStr = ' {:<19} {} @[ IoU={:<9} | catId={:>3s} | area={:>6s} | length={:>6s} | maxDets={:>3d} ] = {:0.3f}'
+            iStr = ' {:<19} {} @[ IoU={:<9} | catId={:>3s} | area={:>6s} | length={:>6s} | speed={:>6s} | maxDets={:>3d} ] = {:0.3f}'
             titleStr = 'Average Precision' if ap == 1 else 'Average Recall'
             typeStr = '(AP)' if ap==1 else '(AR)'
             iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
@@ -560,6 +583,7 @@ class VideoEval:
 
             aind = [i for i, aRng in enumerate(p.areaRngLbl) if aRng == areaRng]
             tempind = [i for i, tRng in enumerate(p.tempRngLbl) if tRng == tempRng]
+            speedind = [i for i, sRng in enumerate(p.speedRngLbl) if sRng == speedRng]
             mind = [i for i, mDet in enumerate(p.maxDets) if mDet == maxDets]
             cind = [i for i, cat in enumerate(p.catIds) if cat == catId] if catId else range(len(p.catIds))
             if ap == 1:
@@ -569,42 +593,33 @@ class VideoEval:
                 if iouThr is not None:
                     t = np.where(iouThr == p.iouThrs)[0]
                     s = s[t]
-                s = s[:,:,cind,aind,tempind,mind]
+                s = s[:,:,cind,aind,tempind,speedind,mind]
             else:
                 # dimension of recall: [TxKxAxM]
                 s = self.eval['recall']
                 if iouThr is not None:
                     t = np.where(iouThr == p.iouThrs)[0]
                     s = s[t]
-                s = s[:,cind,aind,tempind,mind]
+                s = s[:,cind,aind,tempind,speedind,mind]
             if len(s[s>-1])==0:
                 mean_s = -1
             else:
                 mean_s = np.mean(s[s>-1])
             catStr = 'all' if catId is None else str(catId)
-            print(iStr.format(titleStr, typeStr, iouStr, catStr, areaRng, tempRng, maxDets, mean_s))
+            print(iStr.format(titleStr, typeStr, iouStr, catStr, areaRng, tempRng, speedRng, maxDets, mean_s))
             return mean_s
         def _summarizeDets(catId=None):
-            stats = np.zeros((19,))
+            stats = np.zeros((10,))
             stats[0] = _summarize(1, catId=catId)
             stats[1] = _summarize(1, iouThr=.3, maxDets=self.params.maxDets[2], catId=catId)
             stats[2] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2], catId=catId)
             stats[3] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2], catId=catId)
-            stats[4] = _summarize(1, areaRng='small', maxDets=self.params.maxDets[2], catId=catId)
-            stats[5] = _summarize(1, areaRng='medium', maxDets=self.params.maxDets[2], catId=catId)
-            stats[6] = _summarize(1, areaRng='large', maxDets=self.params.maxDets[2], catId=catId)
-            stats[7] = _summarize(1, tempRng='short', maxDets=self.params.maxDets[2], catId=catId)
-            stats[8] = _summarize(1, tempRng='medium', maxDets=self.params.maxDets[2], catId=catId)
-            stats[9] = _summarize(1, tempRng='long', maxDets=self.params.maxDets[2], catId=catId)
-            stats[10] = _summarize(0, maxDets=self.params.maxDets[0], catId=catId)
-            stats[11] = _summarize(0, maxDets=self.params.maxDets[1], catId=catId)
-            stats[12] = _summarize(0, maxDets=self.params.maxDets[2], catId=catId)
-            stats[13] = _summarize(0, areaRng='small', maxDets=self.params.maxDets[2], catId=catId)
-            stats[14] = _summarize(0, areaRng='medium', maxDets=self.params.maxDets[2], catId=catId)
-            stats[15] = _summarize(0, areaRng='large', maxDets=self.params.maxDets[2], catId=catId)
-            stats[16] = _summarize(0, tempRng='short', maxDets=self.params.maxDets[2], catId=catId)
-            stats[17] = _summarize(0, tempRng='medium', maxDets=self.params.maxDets[2], catId=catId)
-            stats[18] = _summarize(0, tempRng='long', maxDets=self.params.maxDets[2], catId=catId)
+            stats[4] = _summarize(1, speedRng='fast', maxDets=self.params.maxDets[2], catId=catId)
+            stats[5] = _summarize(1, speedRng='medium', maxDets=self.params.maxDets[2], catId=catId)
+            stats[6] = _summarize(1, speedRng='slow', maxDets=self.params.maxDets[2], catId=catId)
+            stats[7] = _summarize(0, speedRng='fast', maxDets=self.params.maxDets[2], catId=catId)
+            stats[8] = _summarize(0, speedRng='medium', maxDets=self.params.maxDets[2], catId=catId)
+            stats[9] = _summarize(0, speedRng='slow', maxDets=self.params.maxDets[2], catId=catId)
             return stats
         def _summarizeKps(catId=None):
             stats = np.zeros((10,))
@@ -645,10 +660,12 @@ class Params:
         self.iouThrs = np.array([0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75])
         self.recThrs = np.linspace(.0, 1.00, np.round((1.00 - .0) / .01) + 1, endpoint=True)
         self.maxDets = [10, 100, 1000]
-        self.areaRng = [[0 ** 2, 1e5 ** 2], [0 ** 2, 32 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e5 ** 2]]
-        self.areaRngLbl = ['all', 'small', 'medium', 'large']
-        self.tempRng = [[0, 1e5], [0, 10], [10, 25], [25, 1e5]]
-        self.tempRngLbl = ['all', 'short', 'medium', 'long']
+        self.areaRng = [[0 ** 2, 1e5 ** 2]] # [[0 ** 2, 1e5 ** 2], [0 ** 2, 32 ** 2], [32 ** 2, 96 ** 2], [96 ** 2, 1e5 ** 2]]
+        self.areaRngLbl = ['all'] # ['all', 'small', 'medium', 'large']
+        self.tempRng = [[0, 1e5]] # [[0, 1e5], [0, 10], [10, 25], [25, 1e5]]
+        self.tempRngLbl = ['all'] # ['all', 'short', 'medium', 'long']
+        self.speedRng = [[0, 1], [0, 0.3], [0.3, 0.7], [0.7, 1]]
+        self.speedRngLbl = ['all', 'fast', 'medium', 'slow']
         self.useCats = 1
 
     def setKpParams(self):
